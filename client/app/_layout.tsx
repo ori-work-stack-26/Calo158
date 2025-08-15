@@ -109,6 +109,7 @@ function useNavigationManager(
   const router = useRouter();
   const lastNavigationRef = useRef<string | null>(null);
   const isNavigatingRef = useRef(false);
+  const navigationTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const segments = useSegments();
 
   useEffect(() => {
@@ -136,14 +137,27 @@ function useNavigationManager(
     isNavigatingRef.current = true;
     lastNavigationRef.current = targetRoute;
 
-    router.replace(targetRoute as any);
+    // Debounce navigation to prevent rapid successive navigations
+    if (navigationTimeoutRef.current) {
+      clearTimeout(navigationTimeoutRef.current);
+    }
 
-    const resetTimeout = setTimeout(() => {
-      isNavigatingRef.current = false;
+    navigationTimeoutRef.current = setTimeout(() => {
+      router.replace(targetRoute as any);
+      
+      const resetTimeout = setTimeout(() => {
+        isNavigatingRef.current = false;
+      }, 200);
+
+      return () => {
+        clearTimeout(resetTimeout);
+      };
     }, 100);
 
     return () => {
-      clearTimeout(resetTimeout);
+      if (navigationTimeoutRef.current) {
+        clearTimeout(navigationTimeoutRef.current);
+      }
     };
   }, [loaded, shouldNavigate, targetRoute, router, segments]);
 }
@@ -262,9 +276,22 @@ const AppContent = React.memo(() => {
   useEffect(() => {
     if (loaded) {
       SplashScreen.hideAsync();
-      NotificationService.requestPermissions().catch((error) => {
-        console.warn("Failed to request notification permissions:", error);
-      });
+      
+      // Initialize notifications with timeout
+      const initNotifications = async () => {
+        try {
+          await Promise.race([
+            NotificationService.requestPermissions(),
+            new Promise((_, reject) =>
+              setTimeout(() => reject(new Error("Notification timeout")), 5000)
+            ),
+          ]);
+        } catch (error) {
+          console.warn("Failed to request notification permissions:", error);
+        }
+      };
+      
+      initNotifications();
     }
   }, [loaded]);
 

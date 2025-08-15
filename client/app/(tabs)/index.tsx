@@ -114,15 +114,21 @@ interface GoalProgress {
   label: string;
 }
 
-// Memoized selectors to prevent unnecessary rerenders
-const selectMealState = (state: RootState) => ({
-  meals: state.meal.meals,
-  isLoading: state.meal.isLoading,
-});
+// Optimized selectors with shallow comparison
+const selectMealState = useMemo(
+  () => (state: RootState) => ({
+    meals: state.meal.meals,
+    isLoading: state.meal.isLoading,
+  }),
+  []
+);
 
-const selectAuthState = (state: RootState) => ({
-  user: state.auth.user,
-});
+const selectAuthState = useMemo(
+  () => (state: RootState) => ({
+    user: state.auth.user,
+  }),
+  []
+);
 
 const HomeScreen = React.memo(() => {
   const dispatch = useDispatch<AppDispatch>();
@@ -182,6 +188,7 @@ const HomeScreen = React.memo(() => {
   const isLoadingRef = useRef(false);
   const lastDataLoadRef = useRef<number>(0);
   const lastFocusTimeRef = useRef<number>(0);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   // Memoized calculations to prevent unnecessary re-renders
   const processedMealsData = useMemo(() => {
@@ -228,7 +235,7 @@ const HomeScreen = React.memo(() => {
     }));
   }, [processedMealsData.dailyTotals]);
 
-  // Optimized user stats loading with caching - FIXED API ROUTE
+  // Optimized user stats loading with caching and abort controller
   const loadUserStats = useCallback(async () => {
     if (!user?.user_id) return;
 
@@ -239,9 +246,18 @@ const HomeScreen = React.memo(() => {
       return;
     }
 
+    // Cancel previous request if still pending
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+
+    abortControllerRef.current = new AbortController();
+
     try {
-      // Fixed: Use the correct API route
-      const response = await api.get(`/user/statistics/${user.user_id}`);
+      const response = await api.get(`/user/statistics/${user.user_id}`, {
+        signal: abortControllerRef.current.signal,
+        timeout: 10000, // 10 second timeout
+      });
       if (response.data.success) {
         const stats = response.data.data;
         const summaryStats: UserStats = {
@@ -256,8 +272,14 @@ const HomeScreen = React.memo(() => {
         setUserStats(summaryStats);
         lastDataLoadRef.current = now;
       }
-    } catch (error) {
+    } catch (error: any) {
+      if (error.name === 'AbortError') {
+        console.log('Request aborted');
+        return;
+      }
       console.error("💥 Error loading user stats:", error);
+    } finally {
+      abortControllerRef.current = null;
     }
   }, [user?.user_id]);
 
@@ -277,9 +299,14 @@ const HomeScreen = React.memo(() => {
       setIsDataLoading(true);
 
       try {
+        // Use Promise.allSettled with timeout for better error handling
+        const timeoutPromise = new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('Request timeout')), 15000)
+        );
+
         const [statsResult, mealsResult] = await Promise.allSettled([
-          loadUserStats(),
-          dispatch(fetchMeals()).unwrap(),
+          Promise.race([loadUserStats(), timeoutPromise]),
+          Promise.race([dispatch(fetchMeals()).unwrap(), timeoutPromise]),
         ]);
 
         if (statsResult.status === "rejected") {
@@ -322,16 +349,28 @@ const HomeScreen = React.memo(() => {
   const loadWaterIntake = useCallback(async () => {
     if (!user?.user_id) return;
 
+    // Add timeout and abort controller for water requests
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
+
     try {
       const today = new Date().toISOString().split("T")[0];
-      const response = await api.get(`/nutrition/water-intake/${today}`);
+      const response = await api.get(`/nutrition/water-intake/${today}`, {
+        signal: controller.signal,
+      });
       if (response.data.success) {
         const serverCups = response.data.data.cups_consumed || 0;
         setWaterCups(serverCups);
         setOptimisticWaterCups(serverCups);
       }
-    } catch (error) {
+    } catch (error: any) {
+      if (error.name === 'AbortError') {
+        console.log('Water intake request aborted');
+        return;
+      }
       console.error("Error loading water intake:", error);
+    } finally {
+      clearTimeout(timeoutId);
     }
   }, [user?.user_id]);
 
@@ -340,12 +379,21 @@ const HomeScreen = React.memo(() => {
 
     setWaterSyncInProgress(true);
 
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 8000);
+
     try {
       const today = new Date().toISOString().split("T")[0];
-      const response = await api.post("/nutrition/water-intake", {
-        cups_consumed: totalCups,
-        date: today,
-      });
+      const response = await api.post(
+        "/nutrition/water-intake",
+        {
+          cups_consumed: totalCups,
+          date: today,
+        },
+        {
+          signal: controller.signal,
+        }
+      );
 
       if (response.data.success) {
         // Update server state to match
@@ -376,9 +424,14 @@ const HomeScreen = React.memo(() => {
         );
       }
     } catch (error: any) {
+      if (error.name === 'AbortError') {
+        console.log('Water sync request aborted');
+        return;
+      }
       console.error("Error syncing water intake:", error);
       // Don't show sync errors to user - handle silently in background
     } finally {
+      clearTimeout(timeoutId);
       setWaterSyncInProgress(false);
     }
   };
@@ -408,10 +461,10 @@ const HomeScreen = React.memo(() => {
       },
     ]);
 
-    // Background sync (fire and forget) with slight delay to batch requests
+    // Background sync with debouncing to batch requests
     setTimeout(() => {
       syncWaterWithServer(newTotal, actionId);
-    }, 300);
+    }, 500); // Increased delay for better batching
   };
 
   const incrementWater = () => {
@@ -496,12 +549,21 @@ const HomeScreen = React.memo(() => {
     setOptimisticWaterCups(waterCups);
   }, [waterCups]);
 
+  // Cleanup effect for abort controllers
+  useEffect(() => {
+    return () => {
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
+    };
+  }, []);
+
   useFocusEffect(
     useCallback(() => {
       if (!user?.user_id || initialLoading) return;
 
       const now = Date.now();
-      const FOCUS_RELOAD_THROTTLE = 10 * 1000;
+      const FOCUS_RELOAD_THROTTLE = 30 * 1000; // Increased throttle time
 
       if (now - lastFocusTimeRef.current > FOCUS_RELOAD_THROTTLE) {
         lastFocusTimeRef.current = now;

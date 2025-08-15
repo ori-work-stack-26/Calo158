@@ -37,6 +37,9 @@ const initialState: MealState = {
 };
 
 const PENDING_MEAL_KEY = "pendingMeal";
+const IMAGE_CACHE_SIZE_LIMIT = 1400000; // ~1MB in base64
+const IMAGE_COMPRESSION_QUALITY = 0.7;
+const MAX_IMAGE_DIMENSION = 800;
 
 // Helper function to compress/resize image if needed
 export const processImage = async (imageUri: string): Promise<string> => {
@@ -54,8 +57,16 @@ export const processImage = async (imageUri: string): Promise<string> => {
           imageData.length
         );
       } else {
-        // Fetch the image and convert to base64
-        const response = await fetch(imageUri);
+        // Fetch the image with timeout and convert to base64
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 10000);
+        
+        const response = await fetch(imageUri, {
+          signal: controller.signal,
+        });
+        
+        clearTimeout(timeoutId);
+        
         if (!response.ok) {
           throw new Error(
             `Failed to fetch image: ${response.status} ${response.statusText}`
@@ -67,8 +78,13 @@ export const processImage = async (imageUri: string): Promise<string> => {
 
         // Convert blob to base64
         const base64Result = await new Promise<string>((resolve, reject) => {
+          const timeoutId = setTimeout(() => {
+            reject(new Error("FileReader timeout"));
+          }, 15000);
+          
           const reader = new FileReader();
           reader.onloadend = () => {
+            clearTimeout(timeoutId);
             const result = reader.result as string;
             if (!result) {
               reject(new Error("FileReader returned null result"));
@@ -85,6 +101,7 @@ export const processImage = async (imageUri: string): Promise<string> => {
             resolve(base64);
           };
           reader.onerror = () => {
+            clearTimeout(timeoutId);
             reject(new Error("FileReader failed to read the image"));
           };
           reader.readAsDataURL(blob);
@@ -93,9 +110,8 @@ export const processImage = async (imageUri: string): Promise<string> => {
         imageData = base64Result;
       }
 
-      // Compress image if it's too large (limit to ~1MB base64)
-      if (imageData.length > 1400000) {
-        // ~1MB in base64
+      // Compress image if it's too large
+      if (imageData.length > IMAGE_CACHE_SIZE_LIMIT) {
         console.log("Image too large, compressing...");
 
         // Create an image element to resize
@@ -105,9 +121,14 @@ export const processImage = async (imageUri: string): Promise<string> => {
 
         const compressedBase64 = await new Promise<string>(
           (resolve, reject) => {
+            const timeoutId = setTimeout(() => {
+              reject(new Error("Image compression timeout"));
+            }, 10000);
+            
             img.onload = () => {
+              clearTimeout(timeoutId);
               // Calculate new dimensions (max 800px on longest side)
-              const maxDimension = 800;
+              const maxDimension = MAX_IMAGE_DIMENSION;
               let { width, height } = img;
 
               if (width > height && width > maxDimension) {
@@ -129,7 +150,7 @@ export const processImage = async (imageUri: string): Promise<string> => {
               ctx.drawImage(img, 0, 0, width, height);
 
               // Convert to base64 with quality compression
-              const compressedDataUrl = canvas.toDataURL("image/jpeg", 0.7);
+              const compressedDataUrl = canvas.toDataURL("image/jpeg", IMAGE_COMPRESSION_QUALITY);
               const compressedBase64 = compressedDataUrl.split(",")[1];
 
               console.log(
@@ -141,8 +162,10 @@ export const processImage = async (imageUri: string): Promise<string> => {
               resolve(compressedBase64);
             };
 
-            img.onerror = () =>
+            img.onerror = () => {
+              clearTimeout(timeoutId);
               reject(new Error("Failed to load image for compression"));
+            };
             img.src = `data:image/jpeg;base64,${imageData}`;
           }
         );
@@ -198,7 +221,7 @@ export const analyzeMeal = createAsyncThunk(
       language?: string;
       editedIngredients?: any[];
     },
-    { rejectWithValue }
+    { rejectWithValue, signal }
   ) => {
     try {
       console.log("Starting meal analysis with base64 data...");
@@ -217,12 +240,19 @@ export const analyzeMeal = createAsyncThunk(
       console.log("Base64 data length:", cleanBase64.length);
 
       // Make the API call with proper error handling
-      const response = await nutritionAPI.analyzeMeal(
-        cleanBase64,
-        params.updateText,
-        params.editedIngredients || [],
-        params.language || "en"
-      );
+      const response = await Promise.race([
+        nutritionAPI.analyzeMeal(
+          cleanBase64,
+          params.updateText,
+          params.editedIngredients || [],
+          params.language || "en",
+          { signal }
+        ),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("Analysis timeout")), 45000)
+        ),
+      ]);
+      
       console.log("API response received:", response);
 
       if (response && response.success && response.data) {
@@ -279,7 +309,11 @@ export const analyzeMeal = createAsyncThunk(
         console.error("Analysis failed:", errorMessage);
         return rejectWithValue(errorMessage);
       }
-    } catch (error) {
+    } catch (error: any) {
+      if (error.name === 'AbortError') {
+        console.log('Analysis request aborted');
+        return rejectWithValue('Analysis was cancelled');
+      }
       console.error("Analysis error details:", error);
 
       let errorMessage = "Analysis failed";
@@ -311,6 +345,8 @@ export const analyzeMeal = createAsyncThunk(
         errorMessage = "Authentication error - please log in again";
       } else if (errorMessage.includes("500")) {
         errorMessage = "Server error - please try again later";
+      } else if (errorMessage.includes("timeout")) {
+        errorMessage = "Analysis is taking too long - please try again";
       }
 
       return rejectWithValue(errorMessage);

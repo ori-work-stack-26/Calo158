@@ -22,7 +22,17 @@ export const useOptimizedAuthSelector = () => {
       }),
       []
     ),
-    shallowEqual
+    (left, right) => {
+      // Custom equality function for better performance
+      return (
+        left?.isAuthenticated === right?.isAuthenticated &&
+        left?.user?.user_id === right?.user?.user_id &&
+        left?.user?.email_verified === right?.user?.email_verified &&
+        left?.user?.subscription_type === right?.user?.subscription_type &&
+        left?.isLoading === right?.isLoading &&
+        left?.error === right?.error
+      );
+    }
   );
 };
 
@@ -38,7 +48,16 @@ export const useOptimizedMealSelector = () => {
       }),
       []
     ),
-    shallowEqual
+    (left, right) => {
+      // Custom equality for meal state
+      return (
+        left?.meals?.length === right?.meals?.length &&
+        left?.isLoading === right?.isLoading &&
+        left?.isAnalyzing === right?.isAnalyzing &&
+        left?.pendingMeal?.timestamp === right?.pendingMeal?.timestamp &&
+        left?.error === right?.error
+      );
+    }
   );
 };
 
@@ -116,7 +135,17 @@ export const useRecentMealsSelector = (limit: number = 5) => {
       },
       [limit]
     ),
-    shallowEqual
+    (left, right) => {
+      // Compare only length and first few items for performance
+      if (left.length !== right.length) return false;
+      if (left.length === 0) return true;
+      
+      // Compare first 3 items only for performance
+      for (let i = 0; i < Math.min(3, left.length); i++) {
+        if (left[i]?.meal_id !== right[i]?.meal_id) return false;
+      }
+      return true;
+    }
   );
 };
 

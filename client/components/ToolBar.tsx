@@ -68,8 +68,10 @@ const ToolBar: React.FC<ToolBarProps> = ({ helpContent }) => {
     const newExpanded = !isExpanded;
     setIsExpanded(newExpanded);
 
-    // Fixed RTL expansion logic
-    const expandDirection = isRTL ? -1 : 1;
+    // FIXED: Invert the expansion direction logic
+    // When toolbar is on the right, expand to the left (negative direction)
+    // When toolbar is on the left, expand to the right (positive direction)
+    const expandDirection = isRTL ? 1 : -1; // Inverted logic
 
     if (newExpanded) {
       // Expand animation
@@ -121,15 +123,26 @@ const ToolBar: React.FC<ToolBarProps> = ({ helpContent }) => {
     button3Position,
   ]);
 
-  const handleLanguageToggle = useCallback(() => {
-    const newLanguage = language === "he" ? "en" : "he";
-    changeLanguage(newLanguage);
-    handleToggleMenu();
-  }, [language, changeLanguage, handleToggleMenu]);
+  const handleLanguageToggle = useCallback(
+    async () => {
+      const newLanguage = language === "he" ? "en" : "he";
+      try {
+        await changeLanguage(newLanguage);
+        handleToggleMenu();
+      } catch (error) {
+        console.error("Error changing language:", error);
+      }
+    },
+    [language, changeLanguage, handleToggleMenu]
+  );
 
   const handleThemeToggle = useCallback(() => {
-    toggleTheme();
-    handleToggleMenu();
+    try {
+      toggleTheme();
+      handleToggleMenu();
+    } catch (error) {
+      console.error("Error toggling theme:", error);
+    }
   }, [toggleTheme, handleToggleMenu]);
 
   const handleHelpPress = useCallback(() => {
@@ -209,13 +222,24 @@ const ToolBar: React.FC<ToolBarProps> = ({ helpContent }) => {
     []
   );
 
-  // Dynamic positioning based on language
+  // Dynamic positioning based on language - FIXED positioning
   const toolbarPosition = useMemo(
     () => ({
       bottom: insets.bottom + 100, // Position above tab bar
       [isRTL ? "left" : "right"]: 24,
     }),
     [insets.bottom, isRTL]
+  );
+
+  // FIXED: Panel positioning - should be opposite to toolbar position
+  const panelPosition = useMemo(
+    () => ({
+      top: 50,
+      // If toolbar is on right, panel should be on left and vice versa
+      [isRTL ? "right" : "left"]: 0,
+      width: Math.min(320, screenWidth - 40),
+    }),
+    [isRTL]
   );
 
   return (
@@ -354,7 +378,7 @@ const ToolBar: React.FC<ToolBarProps> = ({ helpContent }) => {
             activeOpacity={1}
           />
 
-          <Animated.View style={[styles.modalContent, modalStyle]}>
+          <Animated.View style={[styles.modalContent, modalStyle, panelPosition]}>
             <LinearGradient
               colors={
                 isDark
@@ -509,7 +533,6 @@ const styles = StyleSheet.create({
     padding: 24,
   },
   modalContent: {
-    width: "100%",
     maxWidth: 420,
     maxHeight: "80%",
     borderRadius: 24,

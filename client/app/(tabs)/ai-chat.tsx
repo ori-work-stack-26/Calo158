@@ -67,6 +67,8 @@ export default function AIChatScreen() {
   });
   const [isLoading, setIsLoading] = useState(true);
   const scrollViewRef = useRef<ScrollView>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const messageTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const isRTL = i18n.language === "he";
   const texts = {
     title: t("ai_chat.title"),
@@ -101,17 +103,37 @@ export default function AIChatScreen() {
   useEffect(() => {
     loadUserProfile();
     loadChatHistory();
+    
+    // Cleanup function
+    return () => {
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
+      if (messageTimeoutRef.current) {
+        clearTimeout(messageTimeoutRef.current);
+      }
+    };
   }, []);
 
   // Auto-scroll when messages change
   useEffect(() => {
-    scrollViewRef.current?.scrollToEnd({ animated: true });
+    // Debounce scroll to end to prevent excessive scrolling
+    const timeoutId = setTimeout(() => {
+      scrollViewRef.current?.scrollToEnd({ animated: true });
+    }, 100);
+    
+    return () => clearTimeout(timeoutId);
   }, [messages]);
 
   const loadUserProfile = async () => {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+
     try {
       console.log("🔄 Loading user profile from questionnaire...");
-      const response = await questionnaireAPI.getQuestionnaire();
+      const response = await questionnaireAPI.getQuestionnaire({
+        signal: controller.signal,
+      });
 
       if (response.success && response.data) {
         const questionnaire = response.data;
@@ -137,17 +159,27 @@ export default function AIChatScreen() {
       } else {
         console.log("⚠️ No questionnaire data found, using empty profile");
       }
-    } catch (error) {
+    } catch (error: any) {
+      if (error.name === 'AbortError') {
+        console.log('Profile loading aborted');
+        return;
+      }
       console.error("💥 Error loading user profile:", error);
     } finally {
+      clearTimeout(timeoutId);
       setIsLoading(false);
     }
   };
 
   const loadChatHistory = async () => {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 8000);
+
     try {
       console.log("📜 Loading chat history...");
-      const response = await chatAPI.getChatHistory(20);
+      const response = await chatAPI.getChatHistory(20, {
+        signal: controller.signal,
+      });
 
       if (
         response &&
@@ -188,7 +220,11 @@ export default function AIChatScreen() {
           },
         ]);
       }
-    } catch (error) {
+    } catch (error: any) {
+      if (error.name === 'AbortError') {
+        console.log('Chat history loading aborted');
+        return;
+      }
       console.error("💥 Error loading chat history:", error);
       // Show welcome message on error
       setMessages([
@@ -200,6 +236,8 @@ export default function AIChatScreen() {
           suggestions: texts.commonQuestions,
         },
       ]);
+    } finally {
+      clearTimeout(timeoutId);
     }
   };
 
@@ -285,6 +323,13 @@ export default function AIChatScreen() {
   const sendMessage = async () => {
     if (!inputText.trim()) return;
 
+    // Cancel previous request if still pending
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+
+    abortControllerRef.current = new AbortController();
+
     const userMessage: Message = {
       id: `user-${Date.now()}`,
       type: "user",
@@ -297,12 +342,34 @@ export default function AIChatScreen() {
     setInputText("");
     setIsTyping(true);
 
+    // Set timeout for message processing
+    messageTimeoutRef.current = setTimeout(() => {
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
+      setIsTyping(false);
+      
+      const errorMessage: Message = {
+        id: `timeout-${Date.now()}`,
+        type: "bot",
+        content: language === "he"
+          ? "הבקשה לקחה יותר מדי זמן. אנא נסה שוב."
+          : "Request timed out. Please try again.",
+        timestamp: new Date(),
+        hasWarning: true,
+      };
+      setMessages((prev) => [...prev, errorMessage]);
+    }, 30000); // 30 second timeout
+
     try {
       console.log("💬 Sending message to AI:", currentMessage);
 
       const response = await chatAPI.sendMessage(
         currentMessage,
-        language === "he" ? "hebrew" : "english"
+        language === "he" ? "hebrew" : "english",
+        {
+          signal: abortControllerRef.current.signal,
+        }
       );
 
       console.log("🔍 Full API response structure:", response);
@@ -351,7 +418,11 @@ export default function AIChatScreen() {
 
       setMessages((prev) => [...prev, aiMessage]);
       console.log("✅ AI response received and displayed successfully");
-    } catch (error) {
+    } catch (error: any) {
+      if (error.name === 'AbortError') {
+        console.log('Message request aborted');
+        return;
+      }
       console.error("💥 Error sending message:", error);
 
       // Add error message
@@ -370,6 +441,11 @@ export default function AIChatScreen() {
 
       Alert.alert(texts.error, texts.networkError);
     } finally {
+      if (messageTimeoutRef.current) {
+        clearTimeout(messageTimeoutRef.current);
+        messageTimeoutRef.current = null;
+      }
+      abortControllerRef.current = null;
       setIsTyping(false);
     }
   };
@@ -386,8 +462,13 @@ export default function AIChatScreen() {
           text: texts.clearChat,
           style: "destructive",
           onPress: async () => {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 5000);
+
             try {
-              await chatAPI.clearHistory();
+              await chatAPI.clearHistory({
+                signal: controller.signal,
+              });
               setMessages([
                 {
                   id: "welcome",
@@ -398,10 +479,16 @@ export default function AIChatScreen() {
                 },
               ]);
               console.log("🗑️ Chat history cleared");
-            } catch (error) {
+            } catch (error: any) {
+              if (error.name === 'AbortError') {
+                console.log('Clear history request aborted');
+                return;
+              }
               console.error("💥 Error clearing chat:", error);
               // Don't show error alert for clearing history
               console.log("⚠️ Failed to clear chat history, but continuing");
+            } finally {
+              clearTimeout(timeoutId);
             }
           },
         },
@@ -409,18 +496,18 @@ export default function AIChatScreen() {
     );
   };
 
-  const selectSuggestion = (suggestion: string) => {
+  const selectSuggestion = useCallback((suggestion: string) => {
     setInputText(suggestion);
-  };
+  }, []);
 
-  const formatTime = (date: Date) => {
+  const formatTime = useCallback((date: Date) => {
     return date.toLocaleTimeString(language === "he" ? "he-IL" : "en-US", {
       hour: "2-digit",
       minute: "2-digit",
     });
-  };
+  }, [language]);
 
-  const renderMessage = (message: Message) => {
+  const renderMessage = useCallback((message: Message) => {
     const isUser = message.type === "user";
 
     return (
@@ -486,7 +573,7 @@ export default function AIChatScreen() {
         </View>
       </View>
     );
-  };
+  }, [texts, formatTime, selectSuggestion]);
 
   if (isLoading) {
     return (

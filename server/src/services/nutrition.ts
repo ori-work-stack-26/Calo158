@@ -4,6 +4,10 @@ import { MealAnalysisInput, MealUpdateInput } from "../types/nutrition";
 import { AuthService } from "./auth";
 import { asJsonObject, mapExistingMealToPrismaInput } from "../utils/nutrition";
 
+// Cache for frequently accessed data
+const userStatsCache = new Map<string, { data: any; timestamp: number }>();
+const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
+
 function transformMealForClient(meal: any) {
   const additives = meal.additives_json || {};
   const feedback = additives.feedback || {};
@@ -85,13 +89,18 @@ export class NutritionService {
       data.editedIngredients?.length || 0
     );
 
-    // Perform AI analysis with proper error handling
-    const analysis = await OpenAIService.analyzeMealImage(
-      cleanBase64,
-      language,
-      data.updateText,
-      data.editedIngredients
-    );
+    // Perform AI analysis with timeout and proper error handling
+    const analysis = await Promise.race([
+      OpenAIService.analyzeMealImage(
+        cleanBase64,
+        language,
+        data.updateText,
+        data.editedIngredients
+      ),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("Analysis timeout after 60 seconds")), 60000)
+      ),
+    ]);
 
     console.log("✅ Analysis completed successfully");
     console.log("📊 Analysis result:", {
@@ -101,10 +110,16 @@ export class NutritionService {
       ingredients_count: analysis.ingredients?.length || 0,
     });
 
-    // Update request count
-    await prisma.user.update({
-      where: { user_id },
-      data: { ai_requests_count: user.ai_requests_count + 1 },
+    // Update request count asynchronously to not block response
+    setImmediate(async () => {
+      try {
+        await prisma.user.update({
+          where: { user_id },
+          data: { ai_requests_count: user.ai_requests_count + 1 },
+        });
+      } catch (error) {
+        console.warn("Failed to update request count:", error);
+      }
     });
 
     // Enhanced ingredient mapping with better error handling
@@ -258,11 +273,17 @@ export class NutritionService {
         health_risk_notes: existingMeal.health_risk_notes || undefined,
       };
 
-      const updatedAnalysis = await OpenAIService.updateMealAnalysis(
-        originalAnalysis,
-        updateData.updateText,
-        updateData.language || "english"
-      );
+      // Add timeout to update analysis
+      const updatedAnalysis = await Promise.race([
+        OpenAIService.updateMealAnalysis(
+          originalAnalysis,
+          updateData.updateText,
+          updateData.language || "english"
+        ),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("Update timeout after 30 seconds")), 30000)
+        ),
+      ]);
 
       // Update meal in database - preserve all existing fields that aren't updated
       const updatedMeal = await prisma.meal.update({
@@ -342,25 +363,49 @@ export class NutritionService {
 
   static async saveMeal(user_id: string, mealData: any, imageBase64?: string) {
     try {
-      const meal = await prisma.meal.create({
-        data: mapMealDataToPrismaFields(mealData, user_id, imageBase64),
+      // Use transaction for better performance and consistency
+      const meal = await prisma.$transaction(async (tx) => {
+        return await tx.meal.create({
+          data: mapMealDataToPrismaFields(mealData, user_id, imageBase64),
+        });
       });
+      
       return transformMealForClient(meal);
     } catch (error) {
+      console.error("💥 Error saving meal:", error);
       throw new Error("Failed to save meal");
     }
   }
 
   static async getUserMeals(user_id: string, offset = 0, limit = 100) {
     try {
+      // Add caching for frequently accessed meals
+      const cacheKey = `meals_${user_id}_${offset}_${limit}`;
+      const cached = userStatsCache.get(cacheKey);
+      
+      if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
+        console.log("🔄 Using cached meals data");
+        return cached.data;
+      }
+
       const meals = await prisma.meal.findMany({
         where: { user_id },
         orderBy: { created_at: "desc" },
         skip: offset,
         take: limit,
       });
-      return meals.map(transformMealForClient);
+      
+      const transformedMeals = meals.map(transformMealForClient);
+      
+      // Cache the result
+      userStatsCache.set(cacheKey, {
+        data: transformedMeals,
+        timestamp: Date.now(),
+      });
+      
+      return transformedMeals;
     } catch (error) {
+      console.error("💥 Error fetching meals:", error);
       throw new Error("Failed to fetch meals");
     }
   }
@@ -373,6 +418,15 @@ export class NutritionService {
     try {
       console.log("📊 Getting range statistics for user:", userId);
       console.log("📅 Date range:", { startDate, endDate });
+
+      // Check cache first
+      const cacheKey = `stats_${userId}_${startDate}_${endDate}`;
+      const cached = userStatsCache.get(cacheKey);
+      
+      if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
+        console.log("🔄 Using cached statistics");
+        return cached.data;
+      }
 
       const startDateTime = new Date(startDate + "T00:00:00.000Z");
       const endDateTime = new Date(endDate + "T23:59:59.999Z");
@@ -388,10 +442,40 @@ export class NutritionService {
         orderBy: {
           created_at: "asc",
         },
+        // Add select to only fetch needed fields for better performance
+        select: {
+          meal_id: true,
+          user_id: true,
+          meal_name: true,
+          calories: true,
+          protein_g: true,
+          carbs_g: true,
+          fats_g: true,
+          fiber_g: true,
+          sugar_g: true,
+          sodium_mg: true,
+          saturated_fats_g: true,
+          polyunsaturated_fats_g: true,
+          monounsaturated_fats_g: true,
+          omega_3_g: true,
+          omega_6_g: true,
+          soluble_fiber_g: true,
+          insoluble_fiber_g: true,
+          cholesterol_mg: true,
+          alcohol_g: true,
+          caffeine_mg: true,
+          liquids_ml: true,
+          serving_size_g: true,
+          glycemic_index: true,
+          insulin_index: true,
+          confidence: true,
+          created_at: true,
+          upload_time: true,
+        },
       });
 
       if (meals.length === 0) {
-        return {
+        const emptyResult = {
           totalDays: 0,
           totalMeals: 0,
           dailyBreakdown: [],
@@ -425,6 +509,14 @@ export class NutritionService {
             ])
           ),
         };
+        
+        // Cache empty result too
+        userStatsCache.set(cacheKey, {
+          data: emptyResult,
+          timestamp: Date.now(),
+        });
+        
+        return emptyResult;
       }
 
       const totalMeals = meals.length;
@@ -554,6 +646,12 @@ export class NutritionService {
         },
       };
 
+      // Cache the result
+      userStatsCache.set(cacheKey, {
+        data: statistics,
+        timestamp: Date.now(),
+      });
+
       console.log("✅ Range statistics calculated successfully");
       return statistics;
     } catch (error) {
@@ -564,6 +662,14 @@ export class NutritionService {
 
   static async getDailyStats(user_id: string, date: string) {
     try {
+      // Check cache first
+      const cacheKey = `daily_${user_id}_${date}`;
+      const cached = userStatsCache.get(cacheKey);
+      
+      if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
+        return cached.data;
+      }
+
       const startDate = new Date(date);
       const endDate = new Date(date);
       endDate.setDate(endDate.getDate() + 1);
@@ -573,9 +679,17 @@ export class NutritionService {
           user_id,
           created_at: { gte: startDate, lt: endDate },
         },
+        select: {
+          calories: true,
+          protein_g: true,
+          carbs_g: true,
+          fats_g: true,
+          fiber_g: true,
+          sugar_g: true,
+        },
       });
 
-      return meals.reduce(
+      const result = meals.reduce(
         (acc, meal) => {
           acc.calories += meal.calories || 0;
           acc.protein += meal.protein_g || 0;
@@ -596,7 +710,16 @@ export class NutritionService {
           meal_count: 0,
         }
       );
+      
+      // Cache the result
+      userStatsCache.set(cacheKey, {
+        data: result,
+        timestamp: Date.now(),
+      });
+      
+      return result;
     } catch (error) {
+      console.error("💥 Error fetching daily stats:", error);
       throw new Error("Failed to fetch daily stats");
     }
   }
@@ -606,6 +729,7 @@ export class NutritionService {
     meal_id: string,
     feedback: any
   ) {
+    try {
     const meal = await prisma.meal.findFirst({
       where: { meal_id: parseInt(meal_id), user_id },
     });
@@ -628,10 +752,18 @@ export class NutritionService {
       data: { additives_json: updatedAdditives },
     });
 
+      // Clear related caches
+      this.clearUserCaches(user_id);
+
     return { meal_id, feedback };
+    } catch (error) {
+      console.error("💥 Error saving meal feedback:", error);
+      throw error;
+    }
   }
 
   static async toggleMealFavorite(user_id: string, meal_id: string) {
+    try {
     const meal = await prisma.meal.findFirst({
       where: { meal_id: parseInt(meal_id), user_id },
     });
@@ -651,7 +783,14 @@ export class NutritionService {
       data: { additives_json: updatedAdditives },
     });
 
+      // Clear related caches
+      this.clearUserCaches(user_id);
+
     return { meal_id, isFavorite: !current };
+    } catch (error) {
+      console.error("💥 Error toggling meal favorite:", error);
+      throw error;
+    }
   }
 
   static async duplicateMeal(
@@ -659,6 +798,7 @@ export class NutritionService {
     meal_id: string,
     newDate?: string
   ) {
+    try {
     const originalMeal = await prisma.meal.findFirst({
       where: { meal_id: parseInt(meal_id), user_id },
     });
@@ -669,7 +809,34 @@ export class NutritionService {
       data: mapExistingMealToPrismaInput(originalMeal, user_id, duplicateDate),
     });
 
+      // Clear related caches
+      this.clearUserCaches(user_id);
+
     return transformMealForClient(duplicatedMeal);
+    } catch (error) {
+      console.error("💥 Error duplicating meal:", error);
+      throw error;
+    }
+  }
+
+  // Helper method to clear user-specific caches
+  private static clearUserCaches(user_id: string) {
+    const keysToDelete: string[] = [];
+    
+    for (const [key] of userStatsCache) {
+      if (key.includes(user_id)) {
+        keysToDelete.push(key);
+      }
+    }
+    
+    keysToDelete.forEach(key => userStatsCache.delete(key));
+    console.log(`🧹 Cleared ${keysToDelete.length} cache entries for user ${user_id}`);
+  }
+
+  // Method to clear all caches
+  static clearAllCaches() {
+    userStatsCache.clear();
+    console.log("🧹 All nutrition service caches cleared");
   }
 }
 
